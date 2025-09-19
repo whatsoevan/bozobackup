@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -19,6 +20,19 @@ func backup(ctx context.Context, srcDir, destDir, dbPath, reportPath string, inc
 
 	db := initDB(dbPath)
 	defer db.Close()
+
+	// Initialize hash cache with pre-loaded hashes for O(1) duplicate checking
+	hashCache, err := NewHashCache(db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FATAL] Could not initialize hash cache: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		// Flush any remaining batched records
+		if err := hashCache.FlushBatch(); err != nil {
+			fmt.Printf("Warning: failed to flush final batch: %v\n", err)
+		}
+	}()
 
 	startTime := time.Now()
 
@@ -90,9 +104,9 @@ func backup(ctx context.Context, srcDir, destDir, dbPath, reportPath string, inc
 			continue
 		}
 
-		// Classify and process the file in one atomic operation
-		// This eliminates classification inconsistencies and scattered accounting
-		result := classifyAndProcessFile(ctx, candidate, db, incremental, minMtime)
+		// Classify and process the file using database-optimized approach
+		// Uses pre-loaded hash cache and batch database operations
+		result := classifyAndProcessFile(ctx, candidate, hashCache, incremental, minMtime)
 		results = append(results, result)
 
 		// Track estimated size for space checking (done incrementally)

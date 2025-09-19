@@ -88,9 +88,12 @@ func TestClassifyAndProcessFileConsistency(t *testing.T) {
 				candidate, _ := NewFileCandidate(firstFile, destDir)
 				candidate.EnsureHash()
 
-				// Insert hash into database manually
-				insertFileRecord(db, firstFile, "/fake/dest/path", candidate.Hash,
-							   int64(len(content)), time.Now().Unix())
+				// Insert hash into database manually using direct SQL
+				_, insertErr := db.Exec("INSERT INTO files (src_path, dest_path, hash, size, mtime, copied_at) VALUES (?, ?, ?, ?, ?, ?)",
+					firstFile, "/fake/dest/path", candidate.Hash, int64(len(content)), time.Now().Unix(), time.Now().Format(time.RFC3339))
+				if insertErr != nil {
+					t.Fatalf("Failed to insert test record: %v", insertErr)
+				}
 
 				// Now create second file with same content
 				duplicateFile := filepath.Join(srcDir, "duplicate.jpg")
@@ -113,8 +116,14 @@ func TestClassifyAndProcessFileConsistency(t *testing.T) {
 				t.Fatalf("Failed to create FileCandidate: %v", err)
 			}
 
+			// Create hash cache for testing
+			hashCache, err := NewHashCache(db)
+			if err != nil {
+				t.Fatalf("Failed to create hash cache: %v", err)
+			}
+
 			// Test unified classification and processing
-			result := classifyAndProcessFile(ctx, candidate, db, tt.incremental, tt.minMtime)
+			result := classifyAndProcessFile(ctx, candidate, hashCache, tt.incremental, tt.minMtime)
 
 			// Verify final state is consistent
 			if result.FinalState != tt.expectedState {

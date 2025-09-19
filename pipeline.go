@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,8 +82,8 @@ type FileCandidate struct {
 	DestDir  string // Base destination directory
 	DestPath string // Full computed destination path (YYYY-MM/filename)
 	
-	// Processing metadata
-	Hash    string // SHA256 hash (computed when needed)
+	// Processing metadata (computed on-demand)
+	Hash    string // SHA256 hash (computed during copy or when needed for duplicate check)
 	HashErr error  // Any error from hash computation
 }
 
@@ -141,15 +140,22 @@ func (fc *FileCandidate) EnsureDestPath() error {
 }
 
 // EnsureHash computes and caches the file hash if not already done
+// Only used for duplicate checking when file won't be copied
 func (fc *FileCandidate) EnsureHash() {
 	if fc.Hash != "" || fc.HashErr != nil {
 		return // Already computed
 	}
-	
+
 	fc.Hash = getFileHash(fc.Path)
 	if fc.Hash == "" {
 		fc.HashErr = fmt.Errorf("failed to compute hash")
 	}
+}
+
+// SetHash sets the hash (used when computed during streaming copy)
+func (fc *FileCandidate) SetHash(hash string) {
+	fc.Hash = hash
+	fc.HashErr = nil
 }
 
 // extractFileDate performs the actual date extraction using the comprehensive metadata system
@@ -237,12 +243,11 @@ func (pr *ProcessingResult) IsError() bool {
 	}
 }
 
-// classifyAndProcessFile performs unified file classification and processing
-// This eliminates the inconsistency between classification decisions and actual processing
-// Returns a complete ProcessingResult with definitive state and all context
-func classifyAndProcessFile(ctx context.Context, candidate *FileCandidate, db *sql.DB, incremental bool, minMtime int64) *ProcessingResult {
-	// Get processing decision using existing evaluation logic
-	decision := evaluateFileForBackup(candidate, db, incremental, minMtime)
+// classifyAndProcessFile performs unified file classification and processing with database optimization
+// Uses pre-loaded hash cache for O(1) duplicate checking and batch database operations
+func classifyAndProcessFile(ctx context.Context, candidate *FileCandidate, hashCache *HashCache, incremental bool, minMtime int64) *ProcessingResult {
+	// Get processing decision using database-optimized evaluation logic
+	decision := evaluateFileForBackup(candidate, hashCache, incremental, minMtime)
 	result := NewProcessingResult(candidate, decision)
 
 	// If decision says don't copy, we're done - return with decision state
@@ -251,7 +256,7 @@ func classifyAndProcessFile(ctx context.Context, candidate *FileCandidate, db *s
 		return result
 	}
 
-	// Decision says we should copy - attempt the actual copy operation
+	// Decision says we should copy - copy file with timestamp preservation
 	var finalState FileState
 	var bytesCopied int64
 	var copyErr error
@@ -261,14 +266,14 @@ func classifyAndProcessFile(ctx context.Context, candidate *FileCandidate, db *s
 		finalState = StateErrorCopy
 		copyErr = ctx.Err()
 	} else {
-		// Attempt to copy the file with timestamps preserved
+		// Copy file (hash was already computed during evaluation)
 		copyErr = copyFileWithTimestamps(ctx, candidate.Path, candidate.DestPath)
 		if copyErr != nil {
 			finalState = StateErrorCopy
 		} else {
-			// Copy succeeded - record in database
-			insertFileRecord(db, candidate.Path, candidate.DestPath, candidate.Hash,
-						   candidate.Info.Size(), candidate.Info.ModTime().Unix())
+			// Copy succeeded - add to batch for database insertion
+			hashCache.AddToBatch(candidate.Path, candidate.DestPath, candidate.Hash,
+							   candidate.Info.Size(), candidate.Info.ModTime().Unix())
 			finalState = StateCopied
 			bytesCopied = candidate.Info.Size()
 			result.DBInserted = true

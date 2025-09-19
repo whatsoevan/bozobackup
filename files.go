@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -86,9 +85,10 @@ func getFileDateWithMetadata(path string) (time.Time, metadata.MetadataResult) {
 	return date, result
 }
 
-// evaluateFileForBackup performs single-pass evaluation of a file for backup
-// This replaces the duplicate logic between the two passes in backup.go
-func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental bool, minMtime int64) ProcessingDecision {
+
+// evaluateFileForBackup performs file evaluation with database optimization
+// Uses pre-loaded hash cache for O(1) duplicate checking
+func evaluateFileForBackup(candidate *FileCandidate, hashCache *HashCache, incremental bool, minMtime int64) ProcessingDecision {
 	// 1. Extension check (already computed in FileCandidate)
 	if !allowedExtensions[candidate.Extension] {
 		return ProcessingDecision{
@@ -97,7 +97,7 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
+
 	// 2. Incremental check (info already cached in FileCandidate)
 	if incremental && minMtime > 0 && candidate.Info.ModTime().Unix() <= minMtime {
 		return ProcessingDecision{
@@ -106,7 +106,7 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
+
 	// 3. Date check (uses cached extraction from metadata system)
 	candidate.EnsureDate()
 	if candidate.DateErr != nil || candidate.Date.IsZero() {
@@ -116,7 +116,7 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
+
 	// 4. Destination path and existence check
 	err := candidate.EnsureDestPath()
 	if err != nil {
@@ -126,11 +126,11 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
+
 	// Create destination directory
 	destMonthDir := filepath.Dir(candidate.DestPath)
 	os.MkdirAll(destMonthDir, 0755)
-	
+
 	// Check if destination file already exists
 	if _, err := os.Stat(candidate.DestPath); err == nil {
 		return ProcessingDecision{
@@ -139,8 +139,9 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
-	// 5. Hash computation and duplicate check (only for files that pass all other checks)
+
+	// 5. DATABASE OPTIMIZATION: Hash computation with pre-loaded cache duplicate checking
+	// Compute hash once, check duplicates using O(1) memory lookup, then copy only if needed
 	candidate.EnsureHash()
 	if candidate.HashErr != nil {
 		return ProcessingDecision{
@@ -149,17 +150,17 @@ func evaluateFileForBackup(candidate *FileCandidate, db *sql.DB, incremental boo
 			ShouldCopy: false,
 		}
 	}
-	
-	// Check for hash duplicates in database
-	if fileAlreadyProcessed(db, candidate.Hash) {
+
+	// Check for duplicates using pre-loaded hash cache (O(1) memory lookup, no DB query)
+	if hashCache.IsProcessed(candidate.Hash) {
 		return ProcessingDecision{
 			State:      StateDuplicateHash,
 			Reason:     "File hash already exists in database",
 			ShouldCopy: false,
 		}
 	}
-	
-	// File should be copied!
+
+	// File is unique and should be copied!
 	return ProcessingDecision{
 		State:         StateCopied,
 		Reason:        "File ready for backup",
@@ -388,6 +389,120 @@ func copyFileWithTimestamps(ctx context.Context, src, dst string) error {
 	}
 	
 	return nil
+}
+
+// copyFileWithHashAndTimestamps combines file copying and hash computation into a single I/O operation.
+// This eliminates the double-read pattern (getFileHash + copyFileWithTimestamps) for 50% I/O reduction.
+//
+// The function:
+// 1. Extracts source file timestamps before copying
+// 2. Performs atomic copy using temporary file (same as copyFileWithTimestamps)
+// 3. Computes SHA256 hash DURING copying using io.MultiWriter (streaming)
+// 4. Preserves original timestamps on the destination file
+// 5. Returns both hash and any error from the operation
+//
+// This is the key optimization for Step 4.1: Streaming I/O
+func copyFileWithHashAndTimestamps(ctx context.Context, src, dst string) (string, error) {
+	// Step 1: Extract source file timestamps before any operations
+	sourceTimestamps, err := getFileTimestamps(src)
+	if err != nil {
+		return "", fmt.Errorf("failed to get source timestamps: %w", err)
+	}
+
+	// Step 2: Perform atomic file copy with simultaneous hash computation
+	tmpDst := dst + ".tmp"
+	in, err := os.Open(src)
+	if err != nil {
+		return "", fmt.Errorf("failed to open source file %s: %w", src, err)
+	}
+	defer in.Close()
+
+	out, err := os.Create(tmpDst)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file %s: %w", tmpDst, err)
+	}
+
+	// Ensure cleanup on error or cancellation
+	defer func() {
+		out.Close()
+		if ctx.Err() != nil {
+			os.Remove(tmpDst)
+		}
+	}()
+
+	// Step 3: Set up streaming hash computation during copy
+	hasher := sha256.New()
+
+	// Create MultiWriter that writes to both file and hasher simultaneously
+	// This is the key optimization: single I/O pass for both operations
+	multiWriter := io.MultiWriter(out, hasher)
+
+	// Copy data with context cancellation support and simultaneous hashing
+	buf := make([]byte, 1024*1024) // 1MB buffer for efficient copying
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			// Single write operation feeds both file and hasher
+			if _, writeErr := multiWriter.Write(buf[:n]); writeErr != nil {
+				return "", fmt.Errorf("failed to write to temp file: %w", writeErr)
+			}
+		}
+
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return "", fmt.Errorf("failed to read from source file: %w", readErr)
+		}
+	}
+
+	// Step 4: Finalize hash computation (no additional I/O needed!)
+	hashBytes := hasher.Sum(nil)
+	hashString := fmt.Sprintf("%x", hashBytes)
+
+	// Step 5: Ensure data is written to disk
+	if err := out.Sync(); err != nil {
+		return "", fmt.Errorf("failed to sync temp file: %w", err)
+	}
+
+	// Close temp file before setting timestamps
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	// Check for cancellation before final operations
+	if ctx.Err() != nil {
+		os.Remove(tmpDst)
+		return "", ctx.Err()
+	}
+
+	// Step 6: Set timestamps on temp file before rename
+	if err := setFileTimestamps(tmpDst, sourceTimestamps); err != nil {
+		os.Remove(tmpDst)
+		return "", fmt.Errorf("failed to set timestamps on temp file: %w", err)
+	}
+
+	// Step 7: Atomically move temp file to final destination
+	if err := os.Rename(tmpDst, dst); err != nil {
+		os.Remove(tmpDst)
+		return "", fmt.Errorf("failed to rename temp file to destination: %w", err)
+	}
+
+	// Step 8: Verify timestamps were preserved correctly (same as copyFileWithTimestamps)
+	if err := verifyTimestamps(dst, sourceTimestamps); err != nil {
+		// Non-fatal error - file was copied successfully but timestamps may not be perfect
+		// Log warning but don't fail the entire operation since hash was computed successfully
+		fmt.Printf("Warning: %v\n", err)
+	}
+
+	// Success: return computed hash and no error
+	return hashString, nil
 }
 
 func checkDirExists(path string, label string) {
